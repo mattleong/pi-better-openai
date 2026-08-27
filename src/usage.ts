@@ -4,6 +4,7 @@ export { AUTH_FILE, readCodexAuth } from "./codex-auth.ts";
 
 export type UsageWindow = {
   used_percent?: number | null;
+  limit_window_seconds?: number | null;
   reset_after_seconds?: number | null;
   reset_at?: number | null;
 };
@@ -20,13 +21,17 @@ export type CodexUsageResponse = {
   additional_rate_limits?: Record<string, unknown> | unknown[] | null;
 };
 
+export type UsageSnapshotWindow = {
+  label: string;
+  leftPercent: number | null;
+  resetInSeconds: number | null;
+  windowSeconds: number | null;
+};
+
 export type UsageSnapshot = {
   capturedAt: number;
   scope: UsageScope;
-  fiveHourLeftPercent: number | null;
-  sevenDayLeftPercent: number | null;
-  fiveHourResetInSeconds: number | null;
-  sevenDayResetInSeconds: number | null;
+  windows: UsageSnapshotWindow[];
   isLimited: boolean;
 };
 
@@ -38,7 +43,6 @@ const SPARK_LIMIT_NAME = "GPT-5.3-Codex-Spark";
 type ResetClockFormatters = {
   time: Intl.DateTimeFormat;
   weekday: Intl.DateTimeFormat;
-  date: Intl.DateTimeFormat;
 };
 const RESET_CLOCK_FORMATTER_CACHE_LIMIT = 4;
 const resetClockFormatters = new Map<string, ResetClockFormatters>();
@@ -55,7 +59,6 @@ function getResetClockFormatters(now: Date, reset: Date): ResetClockFormatters {
     formatters = {
       time: new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }),
       weekday: new Intl.DateTimeFormat(undefined, { weekday: "short" }),
-      date: new Intl.DateTimeFormat(undefined, { month: "numeric", day: "numeric" }),
     };
     resetClockFormatters.set(timeZoneKey, formatters);
     while (resetClockFormatters.size > RESET_CLOCK_FORMATTER_CACHE_LIMIT) {
@@ -88,38 +91,20 @@ export function formatResetCountdown(seconds: number | null): string | null {
   const hours = Math.floor((total % 86_400) / 3_600);
   const minutes = Math.floor((total % 3_600) / 60);
   const secs = total % 60;
-  if (days > 0) return `${days}d${hours}h`;
-  if (hours > 0) return `${hours}h${minutes}m`;
+  if (days > 0) return `${days}d${hours > 0 ? ` ${hours}h` : ""}`;
+  if (hours > 0) return `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}`;
   if (minutes > 0) return `${minutes}m`;
   return `${secs}s`;
 }
 
-function formatResetClock(
-  seconds: number | null,
-  options?: { includeDate?: boolean },
-  now = Date.now(),
-): string | null {
+function formatResetClock(seconds: number | null, now = Date.now()): string | null {
   if (typeof seconds !== "number" || !Number.isFinite(seconds)) return null;
   const resetDate = new Date(now + seconds * 1000);
   const currentDate = new Date(now);
   const formatters = getResetClockFormatters(currentDate, resetDate);
   const time = formatters.time.format(resetDate);
-  if (!options?.includeDate && resetDate.toDateString() === currentDate.toDateString()) return time;
-  const weekday = formatters.weekday.format(resetDate);
-  if (!options?.includeDate) return `${weekday} ${time}`;
-  const date = formatters.date.format(resetDate);
-  return `${weekday} ${date} ${time}`;
-}
-
-function formatCompactReset(
-  label: string,
-  seconds: number | null,
-  options?: { includeDate?: boolean },
-  now = Date.now(),
-): string | null {
-  const countdown = formatResetCountdown(seconds);
-  const clock = formatResetClock(seconds, options, now);
-  return countdown && clock ? `${label} ↺ ${countdown} - ${clock}` : null;
+  if (resetDate.toDateString() === currentDate.toDateString()) return time;
+  return `${formatters.weekday.format(resetDate)} ${time}`;
 }
 
 function isAbortSignal(value: unknown): value is AbortSignal {
@@ -202,6 +187,35 @@ export function usageScopeForModel(modelId: string | undefined): UsageScope {
   return modelId === SPARK_MODEL_ID ? "spark" : "default";
 }
 
+function formatUsageWindowLabel(seconds: number | null, fallbackIndex: number): string {
+  if (seconds !== null) {
+    if (seconds % 86_400 === 0) return `${seconds / 86_400}d`;
+    if (seconds % 3_600 === 0) return `${seconds / 3_600}h`;
+    if (seconds % 60 === 0) return `${seconds / 60}m`;
+    return `${seconds}s`;
+  }
+  return fallbackIndex === 0 ? "5h" : "7d";
+}
+
+function parseUsageWindow(
+  window: UsageWindow,
+  fallbackIndex: number,
+  now: number,
+): UsageSnapshotWindow {
+  const windowSeconds =
+    typeof window.limit_window_seconds === "number" &&
+    Number.isFinite(window.limit_window_seconds) &&
+    window.limit_window_seconds > 0
+      ? window.limit_window_seconds
+      : null;
+  return {
+    label: formatUsageWindowLabel(windowSeconds, fallbackIndex),
+    leftPercent: usedToLeftPercent(window.used_percent),
+    resetInSeconds: getResetSeconds(window, now),
+    windowSeconds,
+  };
+}
+
 export function parseUsageSnapshot(
   data: CodexUsageResponse,
   modelId: string | undefined,
@@ -212,13 +226,17 @@ export function parseUsageSnapshot(
     scope === "spark"
       ? (findSparkRateLimitBucket(data) ?? normalizeRateLimitBucket(data.rate_limit))
       : normalizeRateLimitBucket(data.rate_limit);
+  const windows = [bucket?.primary_window, bucket?.secondary_window]
+    .map((window, index) => (window ? parseUsageWindow(window, index, now) : null))
+    .filter((window): window is UsageSnapshotWindow => window !== null)
+    .sort((left, right) => {
+      if (left.windowSeconds === null || right.windowSeconds === null) return 0;
+      return left.windowSeconds - right.windowSeconds;
+    });
   return {
     capturedAt: now,
     scope,
-    fiveHourLeftPercent: usedToLeftPercent(bucket?.primary_window?.used_percent),
-    sevenDayLeftPercent: usedToLeftPercent(bucket?.secondary_window?.used_percent),
-    fiveHourResetInSeconds: getResetSeconds(bucket?.primary_window, now),
-    sevenDayResetInSeconds: getResetSeconds(bucket?.secondary_window, now),
+    windows,
     isLimited: bucket?.limit_reached === true || bucket?.allowed === false,
   };
 }
@@ -234,25 +252,16 @@ export function formatUsageSnapshot(
   options: { showResetTimes: boolean },
   now = Date.now(),
 ): string {
-  const fiveHour = formatPercent(snapshot.fiveHourLeftPercent);
-  const sevenDay = formatPercent(snapshot.sevenDayLeftPercent);
-  const resets = options.showResetTimes
-    ? [
-        formatCompactReset(
-          "5h",
-          remainingResetSeconds(snapshot.fiveHourResetInSeconds, snapshot.capturedAt, now),
-          undefined,
-          now,
-        ),
-        formatCompactReset(
-          "7d",
-          remainingResetSeconds(snapshot.sevenDayResetInSeconds, snapshot.capturedAt, now),
-          { includeDate: true },
-          now,
-        ),
-      ].filter((value): value is string => value !== null)
-    : [];
-  return `Usage: 5h: ${fiveHour} | 7d: ${sevenDay}${resets.length ? ` | ${resets.join(" | ")}` : ""}`;
+  const windows = snapshot.windows.map((window) => {
+    const usage = `${window.label} ${formatPercent(window.leftPercent)}`;
+    if (!options.showResetTimes) return usage;
+
+    const resetInSeconds = remainingResetSeconds(window.resetInSeconds, snapshot.capturedAt, now);
+    const countdown = formatResetCountdown(resetInSeconds);
+    const clock = formatResetClock(resetInSeconds, now);
+    return countdown && clock ? `${usage} · resets in ${countdown} (${clock})` : usage;
+  });
+  return `Usage: ${windows.length > 0 ? windows.join(" | ") : "--"}`;
 }
 
 function remainingResetSeconds(
