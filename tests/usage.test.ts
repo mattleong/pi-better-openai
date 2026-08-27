@@ -72,8 +72,16 @@ function usageResponseBody() {
   return {
     rate_limit: {
       allowed: true,
-      primary_window: { used_percent: 10, reset_after_seconds: 60 },
-      secondary_window: { used_percent: 20, reset_after_seconds: 3600 },
+      primary_window: {
+        used_percent: 10,
+        limit_window_seconds: 18000,
+        reset_after_seconds: 60,
+      },
+      secondary_window: {
+        used_percent: 20,
+        limit_window_seconds: 604800,
+        reset_after_seconds: 3600,
+      },
     },
   };
 }
@@ -203,17 +211,78 @@ describe("usage helpers", () => {
       {
         rate_limit: {
           allowed: true,
-          primary_window: { used_percent: 1, reset_after_seconds: 60 },
-          secondary_window: { used_percent: 49, reset_after_seconds: 3600 },
+          primary_window: {
+            used_percent: 1,
+            limit_window_seconds: 18000,
+            reset_after_seconds: 60,
+          },
+          secondary_window: {
+            used_percent: 49,
+            limit_window_seconds: 604800,
+            reset_after_seconds: 3600,
+          },
         },
       },
       "gpt-5.5",
     );
-    expect(usage.fiveHourLeftPercent).toBe(99);
-    expect(usage.sevenDayLeftPercent).toBe(51);
+    expect(usage.windows).toEqual([
+      { label: "5h", leftPercent: 99, resetInSeconds: 60, windowSeconds: 18000 },
+      { label: "7d", leftPercent: 51, resetInSeconds: 3600, windowSeconds: 604800 },
+    ]);
     expect(usage.isLimited).toBe(false);
-    expect(_test.formatUsageSnapshot(usage, { showResetTimes: false })).toMatch(
-      /^Usage: 5h: 99% \| 7d: 51%$/,
+    expect(_test.formatUsageSnapshot(usage, { showResetTimes: false })).toBe(
+      "Usage: 5h 99% | 7d 51%",
+    );
+  });
+
+  test("labels an active weekly primary window from its duration", () => {
+    const capturedAt = new Date("2026-08-27T12:14:00Z").getTime();
+    const usage = _test.parseUsageSnapshot(
+      {
+        rate_limit: {
+          primary_window: {
+            used_percent: 8,
+            limit_window_seconds: 604800,
+            reset_after_seconds: 446400,
+          },
+          secondary_window: null,
+        },
+      },
+      "gpt-5.6-sol",
+      capturedAt,
+    );
+
+    expect(_test.formatUsageSnapshot(usage, { showResetTimes: true }, capturedAt)).toBe(
+      `Usage: 7d 92% · resets in 5d 4h (${new Date(capturedAt + 446400_000).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })})`,
+    );
+  });
+
+  test("formats unknown window durations without positional assumptions", () => {
+    const usage = _test.parseUsageSnapshot(
+      {
+        rate_limit: {
+          primary_window: { used_percent: 25, limit_window_seconds: 172800 },
+        },
+      },
+      "gpt-5.6-sol",
+    );
+
+    expect(_test.formatUsageSnapshot(usage, { showResetTimes: false })).toBe("Usage: 2d 75%");
+  });
+
+  test("falls back to legacy positional labels when window durations are absent", () => {
+    const usage = _test.parseUsageSnapshot(
+      {
+        rate_limit: {
+          primary_window: { used_percent: 10 },
+          secondary_window: { used_percent: 20 },
+        },
+      },
+      "gpt-5.5",
+    );
+
+    expect(_test.formatUsageSnapshot(usage, { showResetTimes: false })).toBe(
+      "Usage: 5h 90% | 7d 80%",
     );
   });
 
@@ -241,11 +310,11 @@ describe("usage helpers", () => {
       capturedAt + 90 * 60_000,
     );
 
-    expect(initial).toContain("5h ↺ 1h0m");
-    expect(later).toContain("5h ↺ 30m");
-    expect(initial.split(" - ")[1]).toBe(later.split(" - ")[1]);
-    expect(expired).toContain("5h ↺ 0s");
-    expect(initial.split(" - ")[1]).toBe(expired.split(" - ")[1]);
+    expect(initial).toContain("5h 90% · resets in 1h");
+    expect(later).toContain("5h 90% · resets in 30m");
+    expect(initial.match(/\(([^)]+)\)$/)?.[1]).toBe(later.match(/\(([^)]+)\)$/)?.[1]);
+    expect(expired).toContain("5h 90% · resets in 0s");
+    expect(initial.match(/\(([^)]+)\)$/)?.[1]).toBe(expired.match(/\(([^)]+)\)$/)?.[1]);
   });
 
   test("refreshes cached reset-clock formatters when the time zone changes", () => {
@@ -283,8 +352,7 @@ describe("usage helpers", () => {
     const usage = _test.parseUsageSnapshot(usageResponseBody(), "gpt-5.3-codex-spark");
 
     expect(usage.scope).toBe("spark");
-    expect(usage.fiveHourLeftPercent).toBe(90);
-    expect(usage.sevenDayLeftPercent).toBe(80);
+    expect(usage.windows.map((window) => window.leftPercent)).toEqual([90, 80]);
   });
 });
 
@@ -438,7 +506,7 @@ describe("usage polling lifecycle", () => {
 
     expect(harness.ctx.ui.setStatus).toHaveBeenCalledWith(
       expect.any(String),
-      expect.stringContaining("5h: 90%"),
+      expect.stringContaining("5h 90%"),
     );
     await emit(harness, "session_shutdown");
   });
@@ -595,7 +663,7 @@ describe("usage polling lifecycle", () => {
       "warning",
     );
     expect(harness.ctx.ui.notify).not.toHaveBeenLastCalledWith(
-      expect.stringContaining("5h: 90%"),
+      expect.stringContaining("5h 90%"),
       expect.anything(),
     );
     expect(harness.ctx.ui.setStatus).toHaveBeenLastCalledWith(expect.any(String), undefined);
